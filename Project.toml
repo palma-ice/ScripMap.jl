@@ -1,0 +1,4 @@
+name = "ScripMap"
+uuid = "b6ec2ef2-b646-47b9-b03b-9e293ca0a609"
+authors = ["Alexander Robinson <robinson@ucm.es>"]
+version = "0.1.0"
