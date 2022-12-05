@@ -17,6 +17,25 @@ function gen_map_filename(src_name::String,dst_name::String,fldr::String,method:
 end
 
 """
+    countoccurances(itr)
+
+    Count occurrences of different values in an array.
+"""
+function countoccurances(itr;wts::Union{T,Nothing}=nothing) where T
+    d = Dict{eltype(itr), Float64}()
+    if isnothing(wts)
+        wts = fill(1.0,length(itr))
+    end
+    for (val,wt) in zip(itr,wts)
+        if isa(val, Number) && isnan(val)
+            continue
+        end
+        d[val] = get(d, val, 0.0) + wt
+    end
+    return d
+end
+
+"""
     map_scrip_load(src_name::String,dst_name::String,fldr::String;method::String="con")
 
     Load a map_scrip_class object into memory
@@ -107,10 +126,10 @@ end
     desribed in the SCRIP documention (Fig. 2.4 in scripusers.pdf). The 
     other methods normalize_opt=['destarea','none'] have not been implemented.
 """
-function map_scrip_field(map::Dict,var_name::String,var1::Array{T,2},method::String,reset::logical,
-                            missing_value::T,mask_pack::Array{logical,2},fill_method::String,
-                            filt_method::String,filt_par::Array{Real},verbose::logical)
+function map_scrip_field(map::Dict,var_name::String,var1::Array{T,2};method::String="mean",
+                            mask_pack::Union{Array{Bool,2},Nothing}=nothing,verbose::Bool=false) where T
 
+# fill_method::String,filt_method::String,filt_par::Array{Real}
 
     # Local variables 
     # integer :: n, k, npts1, npts2
@@ -137,279 +156,231 @@ function map_scrip_field(map::Dict,var_name::String,var1::Array{T,2},method::Str
     # integer :: npts_apply 
     # real(dp) :: mean2, mean2b           ! Check mean before/after filtering
 
-    npts1 = size(var1,1)*size(var1,2)
-    npts2 = size(var2,1)*size(var2,2)
+    # Confirm that source (var1) array matches map. 
+    @assert length(var1) == map["src_grid_size"] 
 
-    ! Confirm that source (var1) and destination (var2)
-    ! arrays match map. 
-    if (npts1 .ne. map%src_grid_size) then 
-    write(*,*) "map_scrip_field:: Error: source array and map size do not match."
-    write(*,*) "size(var1): ", size(var1,1), size(var1,2), " = ", npts1
-    write(*,*) "map%src_grid_size = ", map%src_grid_size 
-    stop 
-    end if 
-    if (npts2 .ne. map%dst_grid_size) then 
-    write(*,*) "map_scrip_field:: Error: dest. array and map size do not match."
-    write(*,*) "size(var2): ", size(var2,1), size(var2,2), " = ", npts2
-    write(*,*) "map%dst_grid_size = ", map%dst_grid_size 
-    stop 
-    end if 
+    npts1 = length(var1);
+    npts2 = map["dst_grid_dims"][1]*map["dst_grid_dims"][2];
 
-    ! By default, method is 'mean' (conservative)
-    method_interp = "mean"
-    if (present(method)) method_interp = trim(method) 
-
-    ! By default, reset target grid points to missing values initially
-    reset_pts = .TRUE. 
-    if (present(reset)) reset_pts = reset 
-
-    ! By defualt missing value is the coordinates package default value
-    missing_val = mv 
-    if (present(missing_value)) missing_val = missing_value
-
-    ! By default, not verbose output 
-    verbose_out = .FALSE. 
-    if (present(verbose)) verbose_out = verbose 
-
-    ! By default, all var2 points are interpolated
-    allocate(maskp(npts2))
-    maskp = .TRUE. 
-    if (present(mask_pack)) maskp = reshape(mask_pack,[npts2])
-
-    ! Count total points to be applied 
-    npts_apply = count(maskp)
-
-    ! Store var1 in vector format
-    allocate(var1_vec(npts1)) 
-    var1_vec = reshape(var1,[npts1])
-
-    ! Store var2 in vector format
-    allocate(var2_vec(npts2))
-    var2_vec = reshape(var2,[npts2])
-
-    ! Allocate mask to keep track of which points have been interpolated 
-    allocate(mask2_vec(npts2))
-    mask2_vec = 0 
-
-    ! Reset output points to missing values
-    if (reset_pts) var2_vec = missing_val 
-
-
-    j1 = 0 
-    j2 = 0 
-
-    ! Loop over target points
-    do k = 1, npts2 
-
-    ! Find the range of link indices that correspond 
-    ! to the current point k, ie, such that:
-    ! map%dst_address(j1:j2) == k 
-    ! Note: dst_address can be expected to be sorted 
-    ! in ascending order.
-    j1 = j2+1 
-
-    ! Check index associated with this address. If 
-    ! it is greater than the current index k, it 
-    ! means this point has no interpolation links,
-    ! so skip this iteration of the main loop.
-    if (map%dst_address(j1) .gt. k) then 
-    j1 = j1-1 
-    cycle 
-    end if 
-
-    ! Given j1 is the start of the addresses associated 
-    ! with the current index k, find the upper range 
-    ! such that map%dst_address(j1:j2) == k and it 
-    ! covers all addresses equal to k.
-    do j = j1, map%num_links
-    if (map%dst_address(j) .eq. map%dst_address(j1) ) then 
-    j2 = j 
-    else 
-    exit 
-    end if 
-    end do 
-
-    ! Determine the number of links 
-    num_links_now = j2-j1+1
-
-    if (num_links_now>max_num_links_now) then
-    write(*,*) "map_scrip_field:: Error: num_links_now>max_num_links_now: ", &
-            num_links_now, max_num_links_now
-    write(*,*) " To avoid this error, increase hard-coded variable 'max_num_links_now' &
-    &in coordinates_mapping_scrip.f90."
-    write(*,*) 
-    stop 
-    endif
-
-    if (maskp(k)) then 
-    ! Only interpolate for desired target points 
-
-    ! Assign data and weights to pointers
-    var1_now(1:num_links_now) = var1_vec(map%src_address(j1:j2))
-    wts1_now(1:num_links_now) = map%remap_matrix(1,j1:j2)
-
-    ! Calculate the total weight associated with this point,
-    ! accounting for missing values in the source array.
-    wts1_tot = sum(wts1_now(1:num_links_now),mask=var1_now(1:num_links_now) .ne. missing_val)
-
-    if (wts1_tot .gt. 0.0d0) then 
-    ! Interpolation data found, proceed to interpolate this point
-
-    var2_vec(k)  = 0.0d0 
-    mask2_vec(k) = 1 
-
-    select case(trim(method_interp))
-
-    case("mean")
-    ! Calculate the area-weighted mean 
-
-    var2_vec(k) = sum((wts1_now(1:num_links_now)/wts1_tot)*var1_now(1:num_links_now), &
-                    mask=var1_now(1:num_links_now) .ne. missing_val)
-
-    case("count")
-    ! Choose the most frequently occurring value, weighted by area
-
-    var2_vec(k) = maxcount(var1_now(1:num_links_now),wts1_now(1:num_links_now),missing_val)
-
-    case("stdev")
-    ! Calculate the weighted standard deviation 
-    ! using unbiased estimator correction 
-
-    npt_now = count(var1_now(1:num_links_now) .ne. missing_val)
-
-    if (npt_now .gt. 2) then
-    ! Only calculate stdev for 2 or more input points
-
-    pt_ave      = sum((wts1_now(1:num_links_now)/wts1_tot)*var1_now(1:num_links_now), &
-                    mask=var1_now(1:num_links_now) .ne. missing_val)
-    var2_vec(k) = (npt_now/(npt_now - 1.0)) &
-    * sum((wts1_now(1:num_links_now)/wts1_tot)*(var1_now(1:num_links_now)-pt_ave)**2, & 
-                            mask=var1_now(1:num_links_now) .ne. missing_val)
-    var2_vec(k) = sqrt(var2_vec(k))
-
+    # By default, all var2 points are interpolated
+    
+    if isnothing(mask_pack)
+        maskp_vec = fill(true,npts2);
     else
-    ! Otherwise assume standard deviation is zero 
-    var2_vec(k) = 0.0d0 
+        maskp_vec = reshape(mask_pack,npts2);
+    end
 
-    end if 
+    # Count total points to be applied 
+    npts_apply = sum(maskp_vec);
+    
+    # Store var1 in vector format 
+    var1_vec = reshape(var1,npts1);
+    
+    # Initialize the output vector of interpolated points
+    # and a mask to keep track of which points were interpolated.
+    var2_vec = fill(NaN,npts2);
+    mask2_vec = fill(false,npts2);
 
-    case DEFAULT 
+    j1 = 0; 
+    j2 = 0;
 
-    write(*,*) "map_scrip_field:: Error: interpolation method not recognized."
-    write(*,*) "method = ", trim(method_interp) 
-    stop 
+    # Loop over target points
+    for k = 1:npts2 
 
-    end select 
+        # Find the range of link indices that correspond 
+        # to the current point k, ie, such that:
+        # map%dst_address(j1:j2) == k 
+        # Note: dst_address can be expected to be sorted 
+        # in ascending order.
+        j1 = j2+1;
 
-    end if 
+        if j1 > length(map["dst_address"])
+            break 
+        end
 
-    end if 
+        # Check index associated with this address. If 
+        # it is greater than the current index k, it 
+        # means this point has no interpolation links,
+        # so skip this iteration of the main loop.
+        if map["dst_address"][j1] > k 
+            j1 = j1-1 
+            continue 
+        end
 
-    end do 
+        # Given j1 is the start of the addresses associated 
+        # with the current index k, find the upper range 
+        # such that map["dst_address"][j1:j2] == k and it 
+        # covers all addresses equal to k.
+        for j = j1:map["num_links"]
+            if map["dst_address"][j] == map["dst_address"][j1] 
+                j2 = j 
+            else 
+                break 
+            end 
+        end 
 
-    ! Send back to 2D array 
-    var2 = reshape(var2_vec,[size(var2,1),size(var2,2)])
+        # Determine the current number of links 
+        num_links_now = j2-j1+1;
 
-    ! Get interpolation mask too if desired 
-    if (present(mask2)) then 
-    mask2 = reshape(mask2_vec,[size(var2,1),size(var2,2)])
-    end if 
+        if maskp_vec[k]
+            # Only interpolate for desired target points 
 
-    ! Allocate mask if needed 
-    if (present(fill_method) .or. present(filt_method)) then
+            # Assign data and weights to current vectors
+            var1_now = var1_vec[map["src_address"][j1:j2]]
+            wts1_now = map["remap_matrix"][1,j1:j2]
 
-    allocate(maskp2d(size(var2,1),size(var2,2)))
-    maskp2d = reshape(maskp,[size(var2,1),size(var2,2)])
+            # Calculate the total weight associated with this point,
+            # accounting for missing values in the source array.
+            kk = findall(.! isnan.(var1_now));
+            wts1_tot = sum(wts1_now[kk]);
 
-    end if 
+            if wts1_tot > 0.0 
+                # Interpolation data found, proceed to interpolate this point
 
-    ! === Filling ===
-    ! Fill in remaining missing values 
+                var2_vec[k]  = 0.0
+                mask2_vec[k] = true
 
-    if (present(fill_method)) then 
+                if method_interp == "mean"
+                    # Calculate the area-weighted mean 
 
-    select case(trim(fill_method))
+                    var2_vec[k] = sum((wts1_now[kk] ./ wts1_tot) .* var1_now[kk])
+                
+                elseif method_interp == "count"
+                    # Choose the most frequently occurring value, weighted by area
 
-    case("weighted")
+                    tmp = countoccurances(var1_now[kk];wts=wts1_now[kk]);
+                    var2_vec[k] = findmax(tmp)[2]; 
+                
+                elseif method_interp == "stdev"
+                    # Calculate the weighted standard deviation 
+                    # using unbiased estimator correction 
 
-    call fill_weighted(var2,missing_val,n=6,mask=maskp2d)
+                    npt_now = length(kk);
 
-    case("nn")
+                    if npt_now > 2
+                        # Only calculate stdev for 2 or more input points
 
-    call fill_nearest(var2,missing_val,mask=maskp2d)
+                        pt_ave      = sum((wts1_now[kk] ./ wts1_tot) .* var1_now[kk])
+                        var2_vec[k] = (npt_now/(npt_now - 1.0)) *
+                                        sum((wts1_now[kk] ./ wts1_tot) .* (var1_now[kk] .- pt_ave).^2)
+                        var2_vec[k] = sqrt(var2_vec[k]);
 
-    case("none") ! eg "none"
+                    else
+                        # Otherwise assume standard deviation is zero 
+                        var2_vec[k] = 0.0 
 
-    ! Pass - no filling applied 
+                    end
 
-    case DEFAULT 
+                else
 
-    write(*,*) "map_scrip_field:: Error: fill method not recognized: "//trim(fill_method)
-    write(*,*) "  fill_method = [weighted,nn,none]."
-    write(*,*) 
-    stop 
+                    error("map_scrip_field:: Interpolation method not recognized. method = $method_interp")
+                
+                end 
 
-    end select
+            end
 
-    end if 
+        end 
 
-    ! === Filtering ===
-    ! Now perform filtering (smoothing) steps if
-    ! the right arguments have been provided. 
+    end # End loop over target points, interpolation complete.
 
-    if (present(filt_method)) then 
+    # Send back to 2D arrays
+    var2  = reshape(var2_vec,Tuple(map["dst_grid_dims"]))
+    mask2 = reshape(mask2_vec,Tuple(map["dst_grid_dims"]))
 
-    ! Update maskp2d to also reflect missing values 
-    maskp2d = reshape(maskp,[size(var2,1),size(var2,2)])
-    maskp2d = (maskp2d .and. var2 .ne. missing_val)
+    # # Allocate mask if needed 
+    # if (present(fill_method) .or. present(filt_method)) then
 
-    ! Calculate grid average before filtering 
-    if (verbose_out .and. npts_apply .gt. 0) then 
-    mean2 = sum(var2,mask=maskp2d) / real(npts_apply,dp)
-    end if 
+    # allocate(maskp2d(size(var2,1),size(var2,2)))
+    # maskp2d = reshape(maskp,[size(var2,1),size(var2,2)])
 
-    select case(trim(filt_method))
+    # end if 
 
-    case("gaussian")
+    # === Filling ===
+    # Fill in remaining missing values 
 
-    call filter_gaussian(var2,sigma=filt_par(1),dx=filt_par(2),mask=maskp2d)
+    # if (present(fill_method)) then 
 
-    case("gaussian-fast")
+    #     select case(trim(fill_method))
 
-    call filter_gaussian_fast(var2,sigma=filt_par(1),dx=filt_par(2),mask=maskp2d)
+    #     case("weighted")
+
+    #     call fill_weighted(var2,missing_val,n=6,mask=maskp2d)
+
+    #     case("nn")
+
+    #     call fill_nearest(var2,missing_val,mask=maskp2d)
+
+    #     case("none") # eg "none"
+
+    #     # Pass - no filling applied 
+
+    #     case DEFAULT 
+
+    #     write(*,*) "map_scrip_field:: Error: fill method not recognized: "//trim(fill_method)
+    #     write(*,*) "  fill_method = [weighted,nn,none]."
+    #     write(*,*) 
+    #     stop 
+
+    #     end select
+
+    # end if 
+
+    # === Filtering ===
+    # Now perform filtering (smoothing) steps if
+    # the right arguments have been provided. 
+
+    # if (present(filt_method)) then 
+
+    #     # Update maskp2d to also reflect missing values 
+    #     maskp2d = reshape(maskp,[size(var2,1),size(var2,2)])
+    #     maskp2d = (maskp2d .and. var2 .ne. missing_val)
+
+    #     # Calculate grid average before filtering 
+    #     if (verbose_out .and. npts_apply .gt. 0) then 
+    #     mean2 = sum(var2,mask=maskp2d) / real(npts_apply,dp)
+    #     end if 
+
+    #     select case(trim(filt_method))
+
+    #     case("gaussian")
+
+    #     call filter_gaussian(var2,sigma=filt_par(1),dx=filt_par(2),mask=maskp2d)
+
+    #     case("gaussian-fast")
+
+    #     call filter_gaussian_fast(var2,sigma=filt_par(1),dx=filt_par(2),mask=maskp2d)
 
 
-    case("poisson")
+    #     case("poisson")
 
-    call filter_poisson(var2,mask=maskp2d,tol=filt_par(1), &
-    missing_value=missing_val,wrapx=.FALSE.,verbose=.FALSE.)
+    #     call filter_poisson(var2,mask=maskp2d,tol=filt_par(1), &
+    #     missing_value=missing_val,wrapx=.FALSE.,verbose=.FALSE.)
 
-    case("none")
+    #     case("none")
 
-    ! Pass - no filtering applied 
+    #     # Pass - no filtering applied 
 
-    case DEFAULT
+    #     case DEFAULT
 
-    write(*,*) "map_scrip_field:: Error: filtering method not recognized: "//trim(filt_method)
-    write(*,*) "  filt_method = [gaussian,gaussian-fast,poisson,none]."
-    write(*,*) 
-    stop 
+    #     write(*,*) "map_scrip_field:: Error: filtering method not recognized: "//trim(filt_method)
+    #     write(*,*) "  filt_method = [gaussian,gaussian-fast,poisson,none]."
+    #     write(*,*) 
+    #     stop 
 
-    end select 
+    #     end select 
 
-    ! Calculate grid average after filtering 
-    if (verbose_out .and. npts_apply .gt. 0) then 
-    mean2b = sum(var2,mask=maskp2d) / real(npts_apply,dp)
-    end if 
+    #     # Calculate grid average after filtering 
+    #     if (verbose_out .and. npts_apply .gt. 0) then 
+    #     mean2b = sum(var2,mask=maskp2d) / real(npts_apply,dp)
+    #     end if 
 
-    if (verbose_out) then 
-    ! Print summary of filtering 
-    write(*,"(4a,2g14.5)") var_name, " - ",filt_method, ": mean[orig,filtered]: ", mean2, mean2b
-    end if 
+    #     if (verbose_out) then 
+    #     # Print summary of filtering 
+    #     write(*,"(4a,2g14.5)") var_name, " - ",filt_method, ": mean[orig,filtered]: ", mean2, mean2b
+    #     end if 
 
-    end if 
+    # end if 
 
-
-    return 
+    return mask2, var2
 
 end
