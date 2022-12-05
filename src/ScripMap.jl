@@ -1,7 +1,7 @@
 
 
 using NCDatasets
-
+using NearestNeighbors
 
 """
     gen_map_filename(src_name::String,dst_name::String,fldr::String,method::String)
@@ -240,18 +240,18 @@ function map_scrip_field(map::Dict,var_name::String,var1::Array{T,2};method::Str
                 var2_vec[k]  = 0.0
                 mask2_vec[k] = true
 
-                if method_interp == "mean"
+                if method == "mean"
                     # Calculate the area-weighted mean 
 
                     var2_vec[k] = sum((wts1_now[kk] ./ wts1_tot) .* var1_now[kk])
                 
-                elseif method_interp == "count"
+                elseif method == "count"
                     # Choose the most frequently occurring value, weighted by area
 
                     tmp = countoccurances(var1_now[kk];wts=wts1_now[kk]);
                     var2_vec[k] = findmax(tmp)[2]; 
                 
-                elseif method_interp == "stdev"
+                elseif method == "stdev"
                     # Calculate the weighted standard deviation 
                     # using unbiased estimator correction 
 
@@ -383,4 +383,60 @@ function map_scrip_field(map::Dict,var_name::String,var1::Array{T,2};method::Str
 
     return mask2, var2
 
+end
+
+function fill_nearest!(var;xx=nothing,yy=nothing)
+
+    # Determine which points need to be filled in
+    kk = findall(isnan.(var));
+    
+    if length(kk) > 0
+        # NaNs are present, make sure the 2D 
+        # x and y locations are defined.
+
+        if isnothing(xx) || isnothing(yy)
+            # Get indices of matrix
+            inds = CartesianIndices(var);
+
+            if isnothing(xx)
+                xx = Float64.(getindex.(inds,1)); 
+            end
+            
+            if isnothing(yy)
+                yy = Float64.(getindex.(inds,2));
+            end
+        
+        end
+
+        # Populate a matrix of x and y locations
+        locs = fill(NaN,2,length(var));
+        locs[1,:] = reshape(xx,length(var));
+        locs[2,:] = reshape(yy,length(var));
+
+        # Generate KD-tree of locations
+        kdtree = KDTree(locs);
+
+        while length(kk) > 0
+            # Iterate until all NaNs are filled in
+
+            # Loop over missing values and fill in with closest neighbor
+            for k in kk
+                xy_now = [xx[k],yy[k]];
+                ii, dists = knn(kdtree, xy_now, 100, true);
+
+                kk1 = findall(.!isnan.(var[ii]));
+                if length(kk1) > 0
+                    var[k] = var[ii[kk1[1]]]
+                end
+
+            end
+
+            # Update NaN count 
+            kk = findall(isnan.(var));
+            
+        end
+
+    end
+
+    return
 end
