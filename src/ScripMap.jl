@@ -2,6 +2,7 @@
 
 using NCDatasets
 using NearestNeighbors
+using ImageFiltering
 
 """
     gen_map_filename(src_name::String,dst_name::String,fldr::String,method::String)
@@ -116,7 +117,11 @@ function map_scrip_load(src_name::String,dst_name::String,fldr::String;method::S
 end
 
 """
-    map_scrip_field(map::Dict,var_name::String,var1::Array{T,2},method::String,reset::logical,
+    map_scrip_field(map::Dict,var_name::String,var1::Array{T,2};method::String="mean",
+                            mask_pack::Union{Array{Bool,2},Nothing}=nothing,verbose::Bool=false,
+                            fill_method::Union{String,Nothing}=nothing,
+                            filt_method::Union{String,Nothing}=nothing,
+                            filt_par::Union{Vector{Real,2},Nothing}=nothing) where T
                             missing_value::T,mask_pack::Array{logical,2},fill_method::String,
                             filt_method::String,filt_par::Array{Real},verbose::logical)
 
@@ -127,34 +132,10 @@ end
     other methods normalize_opt=['destarea','none'] have not been implemented.
 """
 function map_scrip_field(map::Dict,var_name::String,var1::Array{T,2};method::String="mean",
-                            mask_pack::Union{Array{Bool,2},Nothing}=nothing,verbose::Bool=false) where T
-
-# fill_method::String,filt_method::String,filt_par::Array{Real}
-
-    # Local variables 
-    # integer :: n, k, npts1, npts2
-    # character(len=56) :: method_interp         
-    # logical           :: reset_pts
-    # double precision  :: missing_val 
-    # logical           :: verbose_out
-    # logical, allocatable  :: maskp(:)
-    # real(dp), allocatable :: area(:)
-    # integer :: i, j, j1, j2  
-
-    # real(dp), allocatable :: var1_vec(:)
-    # real(dp), allocatable :: var2_vec(:) 
-    # integer, allocatable  :: mask2_vec(:) 
-    # real(dp) :: area_tot, pt_ave, pt_var   
-    # integer  :: npt_now, num_links_now 
-    # integer, parameter :: max_num_links_now = 10000
-    # real(dp), dimension(max_num_links_now) :: var1_now 
-    # real(dp), dimension(max_num_links_now) :: wts1_now 
-    # real(dp) :: wts1_tot 
-
-    # logical, allocatable  :: maskp2d(:,:) 
-
-    # integer :: npts_apply 
-    # real(dp) :: mean2, mean2b           ! Check mean before/after filtering
+                            mask_pack::Union{Array{Bool,2},Nothing}=nothing,verbose::Bool=false,
+                            fill_method::Union{String,Nothing}=nothing,
+                            filt_method::Union{String,Nothing}=nothing,
+                            filt_par::Union{Vector{T},Nothing}=nothing) where T
 
     # Confirm that source (var1) array matches map. 
     @assert length(var1) == map["src_grid_size"] 
@@ -226,58 +207,12 @@ function map_scrip_field(map::Dict,var_name::String,var1::Array{T,2};method::Str
             # Only interpolate for desired target points 
 
             # Assign data and weights to current vectors
-            var1_now = var1_vec[map["src_address"][j1:j2]]
-            wts1_now = map["remap_matrix"][1,j1:j2]
+            var1_now = var1_vec[map["src_address"][j1:j2]];
+            wts1_now = map["remap_matrix"][1,j1:j2];
 
-            # Calculate the total weight associated with this point,
-            # accounting for missing values in the source array.
-            kk = findall(.! isnan.(var1_now));
-            wts1_tot = sum(wts1_now[kk]);
-
-            if wts1_tot > 0.0 
-                # Interpolation data found, proceed to interpolate this point
-
-                var2_vec[k]  = 0.0
-                mask2_vec[k] = true
-
-                if method == "mean"
-                    # Calculate the area-weighted mean 
-
-                    var2_vec[k] = sum((wts1_now[kk] ./ wts1_tot) .* var1_now[kk])
-                
-                elseif method == "count"
-                    # Choose the most frequently occurring value, weighted by area
-
-                    tmp = countoccurances(var1_now[kk];wts=wts1_now[kk]);
-                    var2_vec[k] = findmax(tmp)[2]; 
-                
-                elseif method == "stdev"
-                    # Calculate the weighted standard deviation 
-                    # using unbiased estimator correction 
-
-                    npt_now = length(kk);
-
-                    if npt_now > 2
-                        # Only calculate stdev for 2 or more input points
-
-                        pt_ave      = sum((wts1_now[kk] ./ wts1_tot) .* var1_now[kk])
-                        var2_vec[k] = (npt_now/(npt_now - 1.0)) *
-                                        sum((wts1_now[kk] ./ wts1_tot) .* (var1_now[kk] .- pt_ave).^2)
-                        var2_vec[k] = sqrt(var2_vec[k]);
-
-                    else
-                        # Otherwise assume standard deviation is zero 
-                        var2_vec[k] = 0.0 
-
-                    end
-
-                else
-
-                    error("map_scrip_field:: Interpolation method not recognized. method = $method_interp")
-                
-                end 
-
-            end
+            # Determine interpolated value for this point 
+            var2_vec[k]  = vec_stat(var1_now;wts=wts1_now,method=method);
+            mask2_vec[k] = true;
 
         end 
 
@@ -286,6 +221,9 @@ function map_scrip_field(map::Dict,var_name::String,var1::Array{T,2};method::Str
     # Send back to 2D arrays
     var2  = reshape(var2_vec,Tuple(map["dst_grid_dims"]))
     mask2 = reshape(mask2_vec,Tuple(map["dst_grid_dims"]))
+
+    # ajr: TO DO: reimplement masking for fill and filter methods 
+    # (to avoid modifying points that should not be modified)
 
     # # Allocate mask if needed 
     # if (present(fill_method) .or. present(filt_method)) then
@@ -298,94 +236,96 @@ function map_scrip_field(map::Dict,var_name::String,var1::Array{T,2};method::Str
     # === Filling ===
     # Fill in remaining missing values 
 
-    # if (present(fill_method)) then 
+    if isnothing(fill_method)
 
-    #     select case(trim(fill_method))
+        # Pass, no filling needed 
 
-    #     case("weighted")
+    else
+        # Perform filling of NaNs based on method of choice
 
-    #     call fill_weighted(var2,missing_val,n=6,mask=maskp2d)
+        if fill_method == "weighted"
 
-    #     case("nn")
+            fill_weighted!(var2;nmax=10)
 
-    #     call fill_nearest(var2,missing_val,mask=maskp2d)
+        elseif fill_method == "nn"
 
-    #     case("none") # eg "none"
+            fill_nearest!(var2)
 
-    #     # Pass - no filling applied 
+        elseif fill_method == "none" # eg "none"
 
-    #     case DEFAULT 
+            # Pass - no filling applied 
 
-    #     write(*,*) "map_scrip_field:: Error: fill method not recognized: "//trim(fill_method)
-    #     write(*,*) "  fill_method = [weighted,nn,none]."
-    #     write(*,*) 
-    #     stop 
+        else
 
-    #     end select
+            error("map_scrip_field:: Error: fill method not recognized: "*fill_method)
 
-    # end if 
+        end
+
+    end
 
     # === Filtering ===
     # Now perform filtering (smoothing) steps if
     # the right arguments have been provided. 
 
-    # if (present(filt_method)) then 
+    if isnothing(filt_method)
+        
+        # Pass, no filtering needed
 
-    #     # Update maskp2d to also reflect missing values 
-    #     maskp2d = reshape(maskp,[size(var2,1),size(var2,2)])
-    #     maskp2d = (maskp2d .and. var2 .ne. missing_val)
+    else 
 
-    #     # Calculate grid average before filtering 
-    #     if (verbose_out .and. npts_apply .gt. 0) then 
-    #     mean2 = sum(var2,mask=maskp2d) / real(npts_apply,dp)
-    #     end if 
+        # ajr: TO DO: reimplement masking
+        # # Update maskp2d to also reflect missing values 
+        # maskp2d = reshape(maskp,[size(var2,1),size(var2,2)])
+        # maskp2d = (maskp2d .and. var2 .ne. missing_val)
 
-    #     select case(trim(filt_method))
+        if isnothing(filt_par)
+            error("To perform filtering of filt_method="*filt_method*", filt_par must be provided.")
+        end
 
-    #     case("gaussian")
+        if filt_method == "gaussian"
+            # Gaussian filter 
+            sigma = filt_par[1];
+            dx    = filt_par[2];
+            sigma_norm = sigma / dx; 
 
-    #     call filter_gaussian(var2,sigma=filt_par(1),dx=filt_par(2),mask=maskp2d)
+            # Perform filtering 
+            imfilter(var2, KernelFactors.gaussian((sigma_norm,sigma_norm)) );
+            
+        elseif filt_method == "poisson"
+            # Poisson filter
 
-    #     case("gaussian-fast")
+            error("Poisson filter not yet implemented.")
 
-    #     call filter_gaussian_fast(var2,sigma=filt_par(1),dx=filt_par(2),mask=maskp2d)
+        elseif filt_method == "none"
+            # No filtering 
 
+            # Pass, do nothing. 
 
-    #     case("poisson")
+        else
 
-    #     call filter_poisson(var2,mask=maskp2d,tol=filt_par(1), &
-    #     missing_value=missing_val,wrapx=.FALSE.,verbose=.FALSE.)
+            error("map_scrip_field:: Error: filtering method not recognized: "*filt_method)
 
-    #     case("none")
+        end
 
-    #     # Pass - no filtering applied 
+    end
 
-    #     case DEFAULT
+    # Finally, convert var2 type to match that of input var1 
+    var2 = convert.(eltype(var1),var2);
 
-    #     write(*,*) "map_scrip_field:: Error: filtering method not recognized: "//trim(filt_method)
-    #     write(*,*) "  filt_method = [gaussian,gaussian-fast,poisson,none]."
-    #     write(*,*) 
-    #     stop 
-
-    #     end select 
-
-    #     # Calculate grid average after filtering 
-    #     if (verbose_out .and. npts_apply .gt. 0) then 
-    #     mean2b = sum(var2,mask=maskp2d) / real(npts_apply,dp)
-    #     end if 
-
-    #     if (verbose_out) then 
-    #     # Print summary of filtering 
-    #     write(*,"(4a,2g14.5)") var_name, " - ",filt_method, ": mean[orig,filtered]: ", mean2, mean2b
-    #     end if 
-
-    # end if 
+    if verbose
+        println("map_scrip_field:: mapped "*var_name)
+    end
 
     return mask2, var2
 
 end
 
-function fill_nearest!(var;xx=nothing,yy=nothing)
+function fill_weighted!(var::Matrix{<:Number};xx::Union{Nothing,Matrix{Union{Missing, Float64}}}=nothing,
+    yy::Union{Nothing,Matrix{Union{Missing, Float64}}}=nothing,nmax::Integer=10,ntree::Integer=100)
+
+    # Consistency checks
+    @assert nmax > 0 
+    @assert ntree >= nmax 
 
     # Determine which points need to be filled in
     kk = findall(isnan.(var));
@@ -422,11 +362,31 @@ function fill_nearest!(var;xx=nothing,yy=nothing)
             # Loop over missing values and fill in with closest neighbor
             for k in kk
                 xy_now = [xx[k],yy[k]];
-                ii, dists = knn(kdtree, xy_now, 100, true);
 
+                # Get many neighbors since some will be missing
+                # e.g., ntree=100 or ntree=1000
+                ii, dists = knn(kdtree, xy_now, ntree, true);
+
+                # Determine which nearest neighbors are not missing
                 kk1 = findall(.!isnan.(var[ii]));
+
                 if length(kk1) > 0
-                    var[k] = var[ii[kk1[1]]]
+
+                    # Limit length to nmax
+                    n = min(length(kk1),nmax);
+                    kk1 = kk1[1:n];
+                    
+                    if n == 1
+                        # Nearest neighbor, only one value used
+                        var[k] = var[ii[kk1[1]]];
+                    else
+                        # Weighted average of non-missing neighbors up to nmax neighbors
+                        vals = var[ii[kk1[1:n]]];
+                        wts  = 1.0 ./ (dists[kk1[1:n]] .+ 1e-10);
+
+                        var[k] = vec_stat(vals;wts,method="mean")
+
+                    end
                 end
 
             end
@@ -439,4 +399,66 @@ function fill_nearest!(var;xx=nothing,yy=nothing)
     end
 
     return
+end
+
+fill_nearest!(var::Matrix{<:Number};xx::Union{Nothing,Matrix{Union{Missing, Float64}}}=nothing,
+yy::Union{Nothing,Matrix{Union{Missing, Float64}}}=nothing,ntree::Integer=100) = fill_weighted!(var;xx,yy,nmax=1,ntree)
+
+function vec_stat(var::Vector{<:Number};wts::Vector{<:Number}=repeat([1.0],length(var)),
+                                                                method::String="mean")
+
+    # Calculate the total weight associated with this point,
+    # accounting for missing values in the source array.
+    kk = findall(.! isnan.(var));
+    wts_tot = sum(wts[kk]);
+
+    if wts_tot > 0.0 
+        # Interpolation data found, proceed to interpolate this point
+
+        if method == "mean"
+            # Calculate the area-weighted mean 
+
+            var_out = sum((wts[kk] ./ wts_tot) .* var[kk])
+        
+        elseif method == "count"
+            # Choose the most frequently occurring value, weighted by area
+
+            tmp = countoccurances(var[kk];wts=wts[kk]);
+            var_out = findmax(tmp)[2]; 
+        
+        elseif method == "stdev"
+            # Calculate the weighted standard deviation 
+            # using unbiased estimator correction 
+
+            npt_now = length(kk);
+
+            if npt_now > 2
+                # Only calculate stdev for 2 or more input points
+
+                pt_ave      = sum((wts[kk] ./ wts_tot) .* var[kk])
+                var_out = (npt_now/(npt_now - 1.0)) *
+                                sum((wts[kk] ./ wts_tot) .* (var[kk] .- pt_ave).^2)
+                var_out = sqrt(var_out);
+
+            else
+                # Otherwise assume standard deviation is zero 
+                var_out = 0.0 
+
+            end
+
+        else
+
+            error("Method not recognized. method = $method")
+        
+        end
+    
+    else
+        # No values available for calculation
+
+        var_out = NaN;
+    
+    end
+
+    return var_out
+
 end
